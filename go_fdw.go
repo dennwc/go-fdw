@@ -111,6 +111,111 @@ import (
 	"unsafe"
 )
 
+var table Table
+
+// SetTable sets a Go objects that will receive all FDW requests.
+// Should be called with user-defined implementation in init().
+func SetTable(t Table) { table = t }
+
+// Explainer is an helper build an EXPLAIN response.
+type Explainer struct {
+	es *C.ExplainState
+}
+
+// Property adds a key-value property to results of EXPLAIN query.
+func (e Explainer) Property(k, v string) {
+	explainPropertyText(C.CString(k), C.CString(v), e.es)
+}
+
+// Options is a set of FDW options provided by user during table creation.
+type Options map[string]string
+
+// Table is a main interface for FDW table.
+//
+// If there are multiple tables created with this module, they can be identified by table options.
+type Table interface {
+	// Stats returns stats for a table.
+	Stats(opts Options) TableStats
+	// Scan starts a new scan of the table.
+	// Iterator should not load data instantly, since Scan will be called for EXPLAIN as well.
+	// Results should be fetched during Next calls.
+	Scan(rel *Relation, opts Options) Iterator
+}
+
+// Iterator is an interface for table scanner implementations.
+type Iterator interface {
+	// Next returns next row (tuple). Nil slice means there is no more rows to scan.
+	Next() []interface{}
+	// Reset restarts an iterator from the beginning (possible with a new data snapshot).
+	Reset()
+	// Close stops an iteration and frees any resources.
+	Close() error
+}
+
+// Explainable is an optional interface for Iterator that can explain it's execution plan.
+type Explainable interface {
+	// Explain is called during EXPLAIN query.
+	Explain(e Explainer)
+}
+
+type Relation struct {
+	ID      Oid
+	IsValid bool
+	Attr    *TupleDesc
+}
+
+type TupleDesc struct {
+	TypeID  Oid
+	TypeMod int
+	HasOid  bool
+	Attrs   []Attr // columns
+}
+
+type Attr struct {
+	Name    string
+	Type    Oid
+	NotNull bool
+}
+
+type TableStats struct {
+	Rows      uint // an estimated number of rows
+	StartCost Cost
+	TotalCost Cost
+}
+
+// Cost is a approximate cost of an operation. See Postgres docs for details.
+type Cost float64
+
+// Oid is a Postgres internal object ID.
+type Oid uint
+
+// A list of constants for Postgres data types
+const (
+	TypeBool        = Oid(C.BOOLOID)
+	TypeBytes       = Oid(C.BYTEAOID)
+	TypeChar        = Oid(C.CHAROID)
+	TypeName        = Oid(C.NAMEOID)
+	TypeInt64       = Oid(C.INT8OID)
+	TypeInt16       = Oid(C.INT2OID)
+	TypeInt16Vector = Oid(C.INT2VECTOROID)
+	TypeInt32       = Oid(C.INT4OID)
+	TypeRegProc     = Oid(C.REGPROCOID)
+	TypeText        = Oid(C.TEXTOID)
+	TypeOid         = Oid(C.OIDOID)
+
+	TypeJson = Oid(C.JSONOID)
+	TypeXml  = Oid(C.XMLOID)
+
+	TypeFloat32 = Oid(C.FLOAT4OID)
+	TypeFloat64 = Oid(C.FLOAT8OID)
+
+	TypeTimestamp = Oid(C.TIMESTAMPOID)
+	TypeInterval  = Oid(C.INTERVALOID)
+)
+
+// FIXME: some black magic here; we save pointers to all necessary functions (passed by glue C code)
+// FIXME: it would be better to link to pg executable properly
+
 var (
 	fmu                   sync.Mutex
 	explainPropertyText   func(qlabel, value *C.char, es *C.ExplainState)
@@ -128,11 +233,9 @@ var (
 	defGetString    func(def *C.DefElem) *C.char
 )
 
-type Cost float64
-type Oid uint
-
 //export goMapFuncs
 func goMapFuncs(h C.GoFdwFunctions) {
+	// called the first time extension is loaded and sets all pointers to external C functions we use
 	fmu.Lock()
 	defer fmu.Unlock()
 
@@ -180,18 +283,10 @@ func goAnalyzeForeignTable(relation C.Relation, fnc *C.AcquireSampleRowsFunc, to
 //export goGetForeignRelSize
 func goGetForeignRelSize(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntableid C.Oid) {
 	// Obtain relation size estimates for a foreign table
-	st := table.Stats()
+	opts := getFTableOptions(Oid(foreigntableid))
+	st := table.Stats(opts)
 	baserel.rows = C.double(st.Rows)
 	baserel.fdw_private = nil
-}
-
-type Explainer struct {
-	es *C.ExplainState
-}
-
-func (e Explainer) Property(k, v string) {
-	explainPropertyText(C.CString(k), C.CString(v), e.es)
-
 }
 
 //export goExplainForeignScan
@@ -213,8 +308,9 @@ func goExplainForeignScan(node *C.ForeignScanState, es *C.ExplainState) {
 
 //export goGetForeignPaths
 func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntableid C.Oid) {
-	st := table.Stats()
-	// Create Possible access paths for a scan on the foreign table
+	// Create possible access paths for a scan on the foreign table
+	opts := getFTableOptions(Oid(foreigntableid))
+	st := table.Stats(opts)
 	addPath(baserel,
 		(*C.Path)(unsafe.Pointer(createForeignscanPath(
 			root,
@@ -342,13 +438,13 @@ func getState(p unsafe.Pointer) *State {
 	return s
 }
 
-func getFTableOptions(id Oid) map[string]string {
+func getFTableOptions(id Oid) Options {
 	f := getForeignTable(C.Oid(id))
 	return getOptions(f.options)
 }
 
-func getOptions(opts *C.List) map[string]string {
-	m := make(map[string]string)
+func getOptions(opts *C.List) Options {
+	m := make(Options)
 	for it := opts.head; it != nil; it = it.next {
 		el := C.cellGetDef(it)
 		name := C.GoString(el.defname)
@@ -407,71 +503,6 @@ func buildAttr(attr *C.FormData_pg_attribute) (out Attr) {
 	return
 }
 
-const (
-	TypeBool        = Oid(C.BOOLOID)
-	TypeBytes       = Oid(C.BYTEAOID)
-	TypeChar        = Oid(C.CHAROID)
-	TypeName        = Oid(C.NAMEOID)
-	TypeInt64       = Oid(C.INT8OID)
-	TypeInt16       = Oid(C.INT2OID)
-	TypeInt16Vector = Oid(C.INT2VECTOROID)
-	TypeInt32       = Oid(C.INT4OID)
-	TypeRegProc     = Oid(C.REGPROCOID)
-	TypeText        = Oid(C.TEXTOID)
-	TypeOid         = Oid(C.OIDOID)
-
-	TypeJson = Oid(C.JSONOID)
-	TypeXml  = Oid(C.XMLOID)
-
-	TypeFloat32 = Oid(C.FLOAT4OID)
-	TypeFloat64 = Oid(C.FLOAT8OID)
-
-	TypeTimestamp = Oid(C.TIMESTAMPOID)
-	TypeInterval  = Oid(C.INTERVALOID)
-)
-
-type Relation struct {
-	ID      Oid
-	IsValid bool
-	Attr    *TupleDesc
-}
-
-type TupleDesc struct {
-	TypeID  Oid
-	TypeMod int
-	HasOid  bool
-	Attrs   []Attr
-}
-
-type Attr struct {
-	Name    string
-	Type    Oid
-	NotNull bool
-}
-
-var table Table
-
-func SetTable(t Table) { table = t }
-
-type TableStats struct {
-	Rows      uint
-	StartCost Cost
-	TotalCost Cost
-}
-
-type Table interface {
-	Stats() TableStats
-	Scan(rel *Relation, opts map[string]string) Iterator
-}
-
-type Iterator interface {
-	Next() []interface{}
-	Reset()
-	Close() error
-}
-
-type Explainable interface {
-	Explain(e Explainer)
-}
+// required by buildmode=c-archive
 
 func main() {}

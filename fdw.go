@@ -1,5 +1,7 @@
 package main
 
+// TODO: This file should be replaced by your actual implementation. Call SetTable in init to start serving queries.
+
 import "fmt"
 
 func init() {
@@ -8,10 +10,10 @@ func init() {
 
 type helloTable struct{ Rows int }
 
-func (t helloTable) Stats() TableStats {
+func (t helloTable) Stats(opts Options) TableStats {
 	return TableStats{Rows: uint(t.Rows), StartCost: 10, TotalCost: 1000}
 }
-func (t helloTable) Scan(rel *Relation, opts map[string]string) Iterator {
+func (t helloTable) Scan(rel *Relation, opts Options) Iterator {
 	return &helloIter{t: t, rel: rel}
 }
 
