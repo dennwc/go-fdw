@@ -2,9 +2,6 @@ package main
 
 //#cgo CFLAGS: -I/usr/include/postgresql/9.6/server -I/usr/include/postgresql/internal
 //
-//#include <sys/stat.h>
-//#include <unistd.h>
-//
 //#include "postgres.h"
 //#include "access/htup_details.h"
 //#include "access/reloptions.h"
@@ -36,6 +33,8 @@ package main
 //typedef HeapTuple (*BuildTupleFromCStringsFunc) (AttInMetadata *attinmeta, char **values);
 //typedef AttInMetadata* (*TupleDescGetAttInMetadataFunc) (TupleDesc tupdesc);
 //typedef TupleTableSlot* (*ExecStoreTupleFunc) (HeapTuple tuple, TupleTableSlot *slot, Buffer buffer, bool shouldFree);
+//typedef ForeignTable* (*GetForeignTableFunc) (Oid relid);
+//typedef char* (*defGetStringFunc) (DefElem *def);
 //
 //typedef struct GoFdwExecutionState
 //{
@@ -52,6 +51,9 @@ package main
 //  BuildTupleFromCStringsFunc BuildTupleFromCStrings;
 //  TupleDescGetAttInMetadataFunc TupleDescGetAttInMetadata;
 //  ExecStoreTupleFunc ExecStoreTuple;
+//
+//  GetForeignTableFunc GetForeignTable;
+//	defGetStringFunc defGetString;
 //} GoFdwFunctions;
 //
 //static inline void callExplainPropertyText(GoFdwFunctions h, const char *qlabel, const char *value, ExplainState *es){
@@ -84,10 +86,20 @@ package main
 //  return (*(h.ExecStoreTuple))(tuple, slot, buffer, shouldFree);
 //}
 //
+//static inline ForeignTable* callGetForeignTable(GoFdwFunctions h, Oid relid){
+//  return (*(h.GetForeignTable))(relid);
+//}
+//
+//static inline char* callDefGetString(GoFdwFunctions h, DefElem *def){
+//  return (*(h.defGetString))(def);
+//}
+//
 //static inline GoFdwExecutionState* makeState(){
 //  GoFdwExecutionState *s = (GoFdwExecutionState *) malloc(sizeof(GoFdwExecutionState));
 //  return s;
 //}
+//
+//static inline DefElem* cellGetDef(ListCell *n) { return (DefElem*)n->data.ptr_value; }
 //
 //static inline void freeState(GoFdwExecutionState * s){ if (s) free(s); }
 import "C"
@@ -95,7 +107,6 @@ import "C"
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"sync"
 	"unsafe"
 )
@@ -112,6 +123,9 @@ var (
 	buildTupleFromCStrings    func(attinmeta *C.AttInMetadata, values **C.char) C.HeapTuple
 	tupleDescGetAttInMetadata func(tupdesc C.TupleDesc) *C.AttInMetadata
 	execStoreTuple            func(tuple C.HeapTuple, slot *C.TupleTableSlot, buffer C.Buffer, shouldFree C.bool) *C.TupleTableSlot
+
+	getForeignTable func(relid C.Oid) *C.ForeignTable
+	defGetString    func(def *C.DefElem) *C.char
 )
 
 type Cost float64
@@ -149,6 +163,18 @@ func goMapFuncs(h C.GoFdwFunctions) {
 	execStoreTuple = func(tuple C.HeapTuple, slot *C.TupleTableSlot, buffer C.Buffer, shouldFree C.bool) *C.TupleTableSlot {
 		return C.callExecStoreTuple(h, tuple, slot, buffer, shouldFree)
 	}
+	getForeignTable = func(relid C.Oid) *C.ForeignTable {
+		return C.callGetForeignTable(h, relid)
+	}
+	defGetString = func(def *C.DefElem) *C.char {
+		return C.callDefGetString(h, def)
+	}
+}
+
+//export goAnalyzeForeignTable
+func goAnalyzeForeignTable(relation C.Relation, fnc *C.AcquireSampleRowsFunc, totalpages *C.BlockNumber) C.bool {
+	*totalpages = 1
+	return 1
 }
 
 //export goGetForeignRelSize
@@ -159,16 +185,30 @@ func goGetForeignRelSize(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntabl
 	baserel.fdw_private = nil
 }
 
-//export goAnalyzeForeignTable
-func goAnalyzeForeignTable(relation C.Relation, fnc *C.AcquireSampleRowsFunc, totalpages *C.BlockNumber) C.bool {
-	*totalpages = 1
-	return 1
+type Explainer struct {
+	es *C.ExplainState
+}
+
+func (e Explainer) Property(k, v string) {
+	explainPropertyText(C.CString(k), C.CString(v), e.es)
+
 }
 
 //export goExplainForeignScan
 func goExplainForeignScan(node *C.ForeignScanState, es *C.ExplainState) {
+	s := getState(node.fdw_state)
+	if s == nil {
+		return
+	}
 	// Produce extra output for EXPLAIN
-	explainPropertyText(C.CString("Powered by"), C.CString("Go FDW"), es)
+	if e, ok := s.Iter.(Explainable); ok {
+		e.Explain(Explainer{es: es})
+	}
+
+	cs := (*C.GoFdwExecutionState)(node.fdw_state)
+	clearState(uint64(cs.tok))
+	C.freeState(cs)
+	node.fdw_state = nil
 }
 
 //export goGetForeignPaths
@@ -179,7 +219,7 @@ func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntablei
 		(*C.Path)(unsafe.Pointer(createForeignscanPath(
 			root,
 			baserel,
-			nil,
+			baserel.reltarget,
 			baserel.rows,
 			st.StartCost,
 			st.TotalCost,
@@ -191,8 +231,81 @@ func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntablei
 	)
 }
 
+//export goBeginForeignScan
+func goBeginForeignScan(node *C.ForeignScanState, eflags C.int) {
+	rel := buildRelation(node.ss.ss_currentRelation)
+	opts := getFTableOptions(rel.ID)
+	s := &State{
+		Rel: rel, Opts: opts,
+		Iter: table.Scan(rel, opts),
+	}
+	i := saveState(s)
+
+	//plan := node.ss.ps.plan
+	//plan := (*C.ForeignScan)(unsafe.Pointer(node.ss.ps.plan))
+
+	cs := C.makeState()
+	cs.tok = C.uint(i)
+	node.fdw_state = unsafe.Pointer(cs)
+
+	//if eflags&C.EXEC_FLAG_EXPLAIN_ONLY != 0 {
+	//	return // Do nothing in EXPLAIN
+	//}
+}
+
+//export goIterateForeignScan
+func goIterateForeignScan(node *C.ForeignScanState) *C.TupleTableSlot {
+	s := getState(node.fdw_state)
+
+	slot := node.ss.ss_ScanTupleSlot
+	execClearTuple(slot)
+
+	row := s.Iter.Next()
+	if row == nil {
+		return slot
+	}
+
+	values := make([]*C.char, len(s.Rel.Attr.Attrs))
+	for i := range s.Rel.Attr.Attrs {
+		v := row[i]
+		if v == nil {
+			p := unsafe.Pointer(uintptr(unsafe.Pointer(slot.tts_isnull)) + uintptr(C.sizeof_bool))
+			*((*C.bool)(p)) = 1
+			continue
+		}
+		values[i] = C.CString(fmt.Sprint(v))
+	}
+
+	rel := node.ss.ss_currentRelation
+	attinmeta := tupleDescGetAttInMetadata(rel.rd_att)
+	tuple := buildTupleFromCStrings(attinmeta, (**C.char)(&values[0]))
+	execStoreTuple(tuple, slot, C.InvalidBuffer, 1)
+	return slot
+}
+
+//export goReScanForeignScan
+func goReScanForeignScan(node *C.ForeignScanState) {
+	// Rescan table, possibly with new parameters
+	s := getState(node.fdw_state)
+	s.Iter.Reset()
+}
+
+//export goEndForeignScan
+func goEndForeignScan(node *C.ForeignScanState) {
+	// Finish scanning foreign table and dispose objects used for this scan
+	s := getState(node.fdw_state)
+	if s == nil {
+		return
+	}
+	cs := (*C.GoFdwExecutionState)(node.fdw_state)
+	clearState(uint64(cs.tok))
+	C.freeState(cs)
+	node.fdw_state = nil
+}
+
 type State struct {
 	Rel  *Relation
+	Opts map[string]string
 	Iter Iterator
 }
 
@@ -218,62 +331,36 @@ func clearState(i uint64) {
 }
 
 func getState(p unsafe.Pointer) *State {
+	if p == nil {
+		return nil
+	}
 	cs := (*C.GoFdwExecutionState)(p)
+	i := uint64(cs.tok)
 	mu.RLock()
-	s := sess[uint64(cs.tok)]
+	s := sess[i]
 	mu.RUnlock()
 	return s
 }
 
-//export goBeginForeignScan
-func goBeginForeignScan(node *C.ForeignScanState, eflags C.int) {
-	if eflags&C.EXEC_FLAG_EXPLAIN_ONLY != 0 {
-		return // Do nothing in EXPLAIN
-	}
-	rel := buildRelation(node.ss.ss_currentRelation)
-	s := &State{Rel: rel, Iter: table.Scan(rel)}
-	log.Printf("rel: %#v, desc: %#v", s.Rel, s.Rel.Attr)
-	i := saveState(s)
-	log.Printf("begin scan (%d): %x", i, int(eflags))
-	cs := C.makeState()
-	cs.tok = C.uint(i)
-	node.fdw_state = unsafe.Pointer(cs)
+func getFTableOptions(id Oid) map[string]string {
+	f := getForeignTable(C.Oid(id))
+	return getOptions(f.options)
 }
 
-//export goIterateForeignScan
-func goIterateForeignScan(node *C.ForeignScanState) *C.TupleTableSlot {
-	s := getState(node.fdw_state)
-	log.Printf("scan (%+v)", s)
-
-	slot := node.ss.ss_ScanTupleSlot
-	execClearTuple(slot)
-
-	row := s.Iter.Next()
-	if row == nil {
-		log.Printf("scan end")
-		return slot
+func getOptions(opts *C.List) map[string]string {
+	m := make(map[string]string)
+	for it := opts.head; it != nil; it = it.next {
+		el := C.cellGetDef(it)
+		name := C.GoString(el.defname)
+		val := C.GoString(defGetString(el))
+		m[name] = val
 	}
-
-	values := make([]*C.char, len(s.Rel.Attr.Attrs))
-	for i := range s.Rel.Attr.Attrs {
-		v := row[i]
-		if v == nil {
-			p := unsafe.Pointer(uintptr(unsafe.Pointer(slot.tts_isnull)) + uintptr(C.sizeof_bool))
-			*((*C.bool)(p)) = 1
-			continue
-		}
-		values[i] = C.CString(fmt.Sprint(v))
-	}
-
-	rel := node.ss.ss_currentRelation
-	attinmeta := tupleDescGetAttInMetadata(rel.rd_att)
-	tuple := buildTupleFromCStrings(attinmeta, (**C.char)(&values[0]))
-	execStoreTuple(tuple, slot, C.InvalidBuffer, 1)
-	return slot
+	return m
 }
 
 func buildRelation(rel C.Relation) *Relation {
 	r := &Relation{
+		ID:      Oid(rel.rd_id),
 		IsValid: goBool(rel.rd_isvalid),
 		Attr:    buildTupleDesc(rel.rd_att),
 	}
@@ -344,6 +431,7 @@ const (
 )
 
 type Relation struct {
+	ID      Oid
 	IsValid bool
 	Attr    *TupleDesc
 }
@@ -361,25 +449,6 @@ type Attr struct {
 	NotNull bool
 }
 
-//export goReScanForeignScan
-func goReScanForeignScan(node *C.ForeignScanState) {
-	// Rescan table, possibly with new parameters
-	s := getState(node.fdw_state)
-	log.Printf("reset (%+v)", s)
-	s.Iter.Reset()
-}
-
-//export goEndForeignScan
-func goEndForeignScan(node *C.ForeignScanState) {
-	// Finish scanning foreign table and dispose objects used for this scan
-	if node.fdw_state != nil {
-		cs := (*C.GoFdwExecutionState)(node.fdw_state)
-		clearState(uint64(cs.tok))
-		C.freeState(cs)
-		node.fdw_state = nil
-	}
-}
-
 var table Table
 
 func SetTable(t Table) { table = t }
@@ -392,13 +461,17 @@ type TableStats struct {
 
 type Table interface {
 	Stats() TableStats
-	Scan(rel *Relation) Iterator
+	Scan(rel *Relation, opts map[string]string) Iterator
 }
 
 type Iterator interface {
 	Next() []interface{}
 	Reset()
 	Close() error
+}
+
+type Explainable interface {
+	Explain(e Explainer)
 }
 
 func main() {}

@@ -59,6 +59,8 @@ go_fdw_handler(PG_FUNCTION_ARGS)
   h.ExecClearTuple = &ExecClearTuple;
   h.ExecStoreTuple = &ExecStoreTuple;
   h.TupleDescGetAttInMetadata = &TupleDescGetAttInMetadata;
+  h.GetForeignTable = &GetForeignTable;
+  h.defGetString = &defGetString;
   goMapFuncs(h);
 
   PG_RETURN_POINTER(fdwroutine);
