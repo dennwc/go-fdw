@@ -17,4 +17,4 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 go: go_fdw.go
-	go build -buildmode=c-archive go_fdw.go
+	go build -buildmode=c-archive go_fdw.go fdw.go

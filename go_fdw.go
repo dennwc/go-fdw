@@ -93,6 +93,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -114,6 +115,7 @@ var (
 )
 
 type Cost float64
+type Oid uint
 
 //export goMapFuncs
 func goMapFuncs(h C.GoFdwFunctions) {
@@ -149,12 +151,11 @@ func goMapFuncs(h C.GoFdwFunctions) {
 	}
 }
 
-const rows = 3
-
 //export goGetForeignRelSize
 func goGetForeignRelSize(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntableid C.Oid) {
 	// Obtain relation size estimates for a foreign table
-	baserel.rows = rows
+	st := table.Stats()
+	baserel.rows = C.double(st.Rows)
 	baserel.fdw_private = nil
 }
 
@@ -167,11 +168,12 @@ func goAnalyzeForeignTable(relation C.Relation, fnc *C.AcquireSampleRowsFunc, to
 //export goExplainForeignScan
 func goExplainForeignScan(node *C.ForeignScanState, es *C.ExplainState) {
 	// Produce extra output for EXPLAIN
-	explainPropertyText(C.CString("Go9"), C.CString("we are running from Go!"), es)
+	explainPropertyText(C.CString("Powered by"), C.CString("Go FDW"), es)
 }
 
 //export goGetForeignPaths
 func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntableid C.Oid) {
+	st := table.Stats()
 	// Create Possible access paths for a scan on the foreign table
 	addPath(baserel,
 		(*C.Path)(unsafe.Pointer(createForeignscanPath(
@@ -179,18 +181,19 @@ func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntablei
 			baserel,
 			nil,
 			baserel.rows,
-			10,   // startup_cost
-			1000, // total_cost
-			nil,  // no pathkeys
-			nil,  // no outer rel either
-			nil,  // no extra plan
+			st.StartCost,
+			st.TotalCost,
+			nil, // no pathkeys
+			nil, // no outer rel either
+			nil, // no extra plan
 			nil,
 		))),
 	)
 }
 
 type State struct {
-	Row int
+	Rel  *Relation
+	Iter Iterator
 }
 
 var (
@@ -227,7 +230,10 @@ func goBeginForeignScan(node *C.ForeignScanState, eflags C.int) {
 	if eflags&C.EXEC_FLAG_EXPLAIN_ONLY != 0 {
 		return // Do nothing in EXPLAIN
 	}
-	i := saveState(&State{Row: 0})
+	rel := buildRelation(node.ss.ss_currentRelation)
+	s := &State{Rel: rel, Iter: table.Scan(rel)}
+	log.Printf("rel: %#v, desc: %#v", s.Rel, s.Rel.Attr)
+	i := saveState(s)
 	log.Printf("begin scan (%d): %x", i, int(eflags))
 	cs := C.makeState()
 	cs.tok = C.uint(i)
@@ -242,26 +248,117 @@ func goIterateForeignScan(node *C.ForeignScanState) *C.TupleTableSlot {
 	slot := node.ss.ss_ScanTupleSlot
 	execClearTuple(slot)
 
-	if s.Row >= rows {
+	row := s.Iter.Next()
+	if row == nil {
 		log.Printf("scan end")
 		return slot
 	}
 
-	rel := node.ss.ss_currentRelation
-	attinmeta := tupleDescGetAttInMetadata(rel.rd_att)
-
-	natts := int(rel.rd_att.natts)
-	values := make([]*C.char, natts)
-
-	for i := 0; i < natts; i++ {
-		values[i] = C.CString(fmt.Sprintf("Row: %d, Col: %d", s.Row, i))
+	values := make([]*C.char, len(s.Rel.Attr.Attrs))
+	for i := range s.Rel.Attr.Attrs {
+		v := row[i]
+		if v == nil {
+			p := unsafe.Pointer(uintptr(unsafe.Pointer(slot.tts_isnull)) + uintptr(C.sizeof_bool))
+			*((*C.bool)(p)) = 1
+			continue
+		}
+		values[i] = C.CString(fmt.Sprint(v))
 	}
 
+	rel := node.ss.ss_currentRelation
+	attinmeta := tupleDescGetAttInMetadata(rel.rd_att)
 	tuple := buildTupleFromCStrings(attinmeta, (**C.char)(&values[0]))
 	execStoreTuple(tuple, slot, C.InvalidBuffer, 1)
-
-	s.Row++
 	return slot
+}
+
+func buildRelation(rel C.Relation) *Relation {
+	r := &Relation{
+		IsValid: goBool(rel.rd_isvalid),
+		Attr:    buildTupleDesc(rel.rd_att),
+	}
+	return r
+}
+
+func goBool(b C.bool) bool {
+	return b != 0
+}
+
+func goString(p unsafe.Pointer, n int) string {
+	b := C.GoBytes(p, C.int(n))
+	i := bytes.IndexByte(b, 0)
+	if i < 0 {
+		i = len(b)
+	}
+	return string(b[:i])
+}
+
+func buildTupleDesc(desc C.TupleDesc) *TupleDesc {
+	if desc == nil {
+		return nil
+	}
+	d := &TupleDesc{
+		TypeID:  Oid(desc.tdtypeid),
+		TypeMod: int(desc.tdtypmod),
+		HasOid:  goBool(desc.tdhasoid),
+		Attrs:   make([]Attr, 0, int(desc.natts)),
+	}
+	for i := 0; i < cap(d.Attrs); i++ {
+		off := uintptr(i) * uintptr(C.sizeof_Form_pg_attribute)
+		p := *(*C.Form_pg_attribute)(unsafe.Pointer(uintptr(unsafe.Pointer(desc.attrs)) + off))
+		d.Attrs = append(d.Attrs, buildAttr(p))
+	}
+	return d
+}
+
+const nameLen = C.NAMEDATALEN
+
+func buildAttr(attr *C.FormData_pg_attribute) (out Attr) {
+	out.Name = goString(unsafe.Pointer(&attr.attname.data[0]), nameLen)
+	out.Type = Oid(attr.atttypid)
+	out.NotNull = goBool(attr.attnotnull)
+	return
+}
+
+const (
+	TypeBool        = Oid(C.BOOLOID)
+	TypeBytes       = Oid(C.BYTEAOID)
+	TypeChar        = Oid(C.CHAROID)
+	TypeName        = Oid(C.NAMEOID)
+	TypeInt64       = Oid(C.INT8OID)
+	TypeInt16       = Oid(C.INT2OID)
+	TypeInt16Vector = Oid(C.INT2VECTOROID)
+	TypeInt32       = Oid(C.INT4OID)
+	TypeRegProc     = Oid(C.REGPROCOID)
+	TypeText        = Oid(C.TEXTOID)
+	TypeOid         = Oid(C.OIDOID)
+
+	TypeJson = Oid(C.JSONOID)
+	TypeXml  = Oid(C.XMLOID)
+
+	TypeFloat32 = Oid(C.FLOAT4OID)
+	TypeFloat64 = Oid(C.FLOAT8OID)
+
+	TypeTimestamp = Oid(C.TIMESTAMPOID)
+	TypeInterval  = Oid(C.INTERVALOID)
+)
+
+type Relation struct {
+	IsValid bool
+	Attr    *TupleDesc
+}
+
+type TupleDesc struct {
+	TypeID  Oid
+	TypeMod int
+	HasOid  bool
+	Attrs   []Attr
+}
+
+type Attr struct {
+	Name    string
+	Type    Oid
+	NotNull bool
 }
 
 //export goReScanForeignScan
@@ -269,7 +366,7 @@ func goReScanForeignScan(node *C.ForeignScanState) {
 	// Rescan table, possibly with new parameters
 	s := getState(node.fdw_state)
 	log.Printf("reset (%+v)", s)
-	s.Row = 0
+	s.Iter.Reset()
 }
 
 //export goEndForeignScan
@@ -281,6 +378,27 @@ func goEndForeignScan(node *C.ForeignScanState) {
 		C.freeState(cs)
 		node.fdw_state = nil
 	}
+}
+
+var table Table
+
+func SetTable(t Table) { table = t }
+
+type TableStats struct {
+	Rows      uint
+	StartCost Cost
+	TotalCost Cost
+}
+
+type Table interface {
+	Stats() TableStats
+	Scan(rel *Relation) Iterator
+}
+
+type Iterator interface {
+	Next() []interface{}
+	Reset()
+	Close() error
 }
 
 func main() {}
