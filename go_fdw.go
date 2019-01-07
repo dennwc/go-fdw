@@ -1,6 +1,8 @@
 package main
 
 //#cgo CFLAGS: -I/usr/include/postgresql/9.6/server -I/usr/include/postgresql/internal
+//// ignoring unresolved symbols means all postgres functions can be dynamically
+//// linked in when the extension is run
 //#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 //#include "postgres.h"
 //#include "funcapi.h"
