@@ -9,6 +9,9 @@
  */
 
 #include "postgres.h"
+#include "optimizer/restrictinfo.h"
+#include "optimizer/planmain.h"
+#include "utils/palloc.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -39,8 +42,6 @@ static ForeignScan *goGetForeignPlan(PlannerInfo *root,
 Datum
 go_fdw_handler(PG_FUNCTION_ARGS)
 {
-  GoFdwFunctions h;
-
   FdwRoutine *fdwroutine = makeNode(FdwRoutine);
   fdwroutine->GetForeignRelSize = goGetForeignRelSize;
   fdwroutine->GetForeignPaths = goGetForeignPaths;
@@ -51,17 +52,6 @@ go_fdw_handler(PG_FUNCTION_ARGS)
   fdwroutine->ReScanForeignScan = goReScanForeignScan;
   fdwroutine->EndForeignScan = goEndForeignScan;
   fdwroutine->AnalyzeForeignTable = goAnalyzeForeignTable;
-
-  h.ExplainPropertyText = &ExplainPropertyText;
-  h.create_foreignscan_path = &create_foreignscan_path;
-  h.add_path = &add_path;
-  h.BuildTupleFromCStrings = &BuildTupleFromCStrings;
-  h.ExecClearTuple = &ExecClearTuple;
-  h.ExecStoreTuple = &ExecStoreTuple;
-  h.TupleDescGetAttInMetadata = &TupleDescGetAttInMetadata;
-  h.GetForeignTable = &GetForeignTable;
-  h.defGetString = &defGetString;
-  goMapFuncs(h);
 
   PG_RETURN_POINTER(fdwroutine);
 }

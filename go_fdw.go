@@ -1,98 +1,23 @@
 package main
 
 //#cgo CFLAGS: -I/usr/include/postgresql/9.6/server -I/usr/include/postgresql/internal
-//
+//// ignoring unresolved symbols means all postgres functions can be dynamically
+//// linked in when the extension is run
+//#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 //#include "postgres.h"
-//#include "access/htup_details.h"
-//#include "access/reloptions.h"
-//#include "access/sysattr.h"
-//#include "catalog/pg_foreign_table.h"
-//#include "commands/copy.h"
+//#include "funcapi.h"
+//#include "catalog/pg_type.h"
 //#include "commands/defrem.h"
-//#include "commands/explain.h"
-//#include "commands/vacuum.h"
 //#include "foreign/fdwapi.h"
 //#include "foreign/foreign.h"
-//#include "funcapi.h"
-//#include "miscadmin.h"
-//#include "nodes/makefuncs.h"
-//#include "optimizer/cost.h"
+//#include "nodes/extensible.h"
 //#include "optimizer/pathnode.h"
-//#include "optimizer/planmain.h"
-//#include "optimizer/restrictinfo.h"
-//#include "optimizer/var.h"
-//#include "utils/memutils.h"
-//#include "utils/rel.h"
-//
-//typedef void (*ExplainPropertyTextFunc) (const char *qlabel, const char *value, ExplainState *es);
-//typedef void (*add_path_func) (RelOptInfo *parent_rel, Path *new_path);
-//typedef ForeignPath* (*create_foreignscan_path_Func) (PlannerInfo *root, RelOptInfo *rel, PathTarget *target,
-//    double rows, Cost startup_cost, Cost total_cost, List *pathkeys,
-//    Relids required_outer, Path *fdw_outerpath, List *fdw_private);
-//typedef TupleTableSlot* (*ExecClearTupleFunc) (TupleTableSlot *slot);
-//typedef HeapTuple (*BuildTupleFromCStringsFunc) (AttInMetadata *attinmeta, char **values);
-//typedef AttInMetadata* (*TupleDescGetAttInMetadataFunc) (TupleDesc tupdesc);
-//typedef TupleTableSlot* (*ExecStoreTupleFunc) (HeapTuple tuple, TupleTableSlot *slot, Buffer buffer, bool shouldFree);
-//typedef ForeignTable* (*GetForeignTableFunc) (Oid relid);
-//typedef char* (*defGetStringFunc) (DefElem *def);
+//#include "utils/tuplestore.h"
 //
 //typedef struct GoFdwExecutionState
 //{
 // uint tok;
 //} GoFdwExecutionState;
-//
-//typedef struct GoFdwFunctions
-//{
-//  ExplainPropertyTextFunc ExplainPropertyText;
-//  create_foreignscan_path_Func create_foreignscan_path;
-//  add_path_func add_path;
-//
-//  ExecClearTupleFunc ExecClearTuple;
-//  BuildTupleFromCStringsFunc BuildTupleFromCStrings;
-//  TupleDescGetAttInMetadataFunc TupleDescGetAttInMetadata;
-//  ExecStoreTupleFunc ExecStoreTuple;
-//
-//  GetForeignTableFunc GetForeignTable;
-//	defGetStringFunc defGetString;
-//} GoFdwFunctions;
-//
-//static inline void callExplainPropertyText(GoFdwFunctions h, const char *qlabel, const char *value, ExplainState *es){
-//  (*(h.ExplainPropertyText))(qlabel, value, es);
-//}
-//
-//static inline void call_add_path(GoFdwFunctions h, RelOptInfo *parent_rel, Path *new_path){
-//  (*(h.add_path))(parent_rel, new_path);
-//}
-//
-//static inline ForeignPath* call_create_foreignscan_path(GoFdwFunctions h, PlannerInfo *root, RelOptInfo *rel, PathTarget *target,
-//    double rows, Cost startup_cost, Cost total_cost, List *pathkeys,
-//    Relids required_outer, Path *fdw_outerpath, List *fdw_private){
-//  return (*(h.create_foreignscan_path))(root,rel,target,rows,startup_cost,total_cost,pathkeys,required_outer,fdw_outerpath,fdw_private);
-//}
-//
-//static inline TupleTableSlot* callExecClearTuple(GoFdwFunctions h, TupleTableSlot* slot){
-//  return (*(h.ExecClearTuple))(slot);
-//}
-//
-//static inline HeapTuple callBuildTupleFromCStrings(GoFdwFunctions h, AttInMetadata *attinmeta, char **values){
-//  return (*(h.BuildTupleFromCStrings))(attinmeta, values);
-//}
-//
-//static inline AttInMetadata* callTupleDescGetAttInMetadata(GoFdwFunctions h, TupleDesc tupdesc){
-//  return (*(h.TupleDescGetAttInMetadata))(tupdesc);
-//}
-//
-//static inline TupleTableSlot* callExecStoreTuple(GoFdwFunctions h, HeapTuple tuple, TupleTableSlot *slot, Buffer buffer, bool shouldFree){
-//  return (*(h.ExecStoreTuple))(tuple, slot, buffer, shouldFree);
-//}
-//
-//static inline ForeignTable* callGetForeignTable(GoFdwFunctions h, Oid relid){
-//  return (*(h.GetForeignTable))(relid);
-//}
-//
-//static inline char* callDefGetString(GoFdwFunctions h, DefElem *def){
-//  return (*(h.defGetString))(def);
-//}
 //
 //static inline GoFdwExecutionState* makeState(){
 //  GoFdwExecutionState *s = (GoFdwExecutionState *) malloc(sizeof(GoFdwExecutionState));
@@ -124,7 +49,7 @@ type Explainer struct {
 
 // Property adds a key-value property to results of EXPLAIN query.
 func (e Explainer) Property(k, v string) {
-	explainPropertyText(C.CString(k), C.CString(v), e.es)
+	C.ExplainPropertyText(C.CString(k), C.CString(v), e.es)
 }
 
 // Options is a set of FDW options provided by user during table creation.
@@ -217,62 +142,8 @@ const (
 // FIXME: it would be better to link to pg executable properly
 
 var (
-	fmu                   sync.Mutex
-	explainPropertyText   func(qlabel, value *C.char, es *C.ExplainState)
-	createForeignscanPath func(root *C.PlannerInfo, rel *C.RelOptInfo, target *C.PathTarget,
-		rows C.double, startup_cost Cost, total_cost Cost, pathkeys *C.List,
-		required_outer C.Relids, fdw_outerpath *C.Path, fdw_private *C.List) *C.ForeignPath
-	addPath func(parent_rel *C.RelOptInfo, new_path *C.Path)
-
-	execClearTuple            func(slot *C.TupleTableSlot) *C.TupleTableSlot
-	buildTupleFromCStrings    func(attinmeta *C.AttInMetadata, values **C.char) C.HeapTuple
-	tupleDescGetAttInMetadata func(tupdesc C.TupleDesc) *C.AttInMetadata
-	execStoreTuple            func(tuple C.HeapTuple, slot *C.TupleTableSlot, buffer C.Buffer, shouldFree C.bool) *C.TupleTableSlot
-
-	getForeignTable func(relid C.Oid) *C.ForeignTable
-	defGetString    func(def *C.DefElem) *C.char
+	fmu sync.Mutex
 )
-
-//export goMapFuncs
-func goMapFuncs(h C.GoFdwFunctions) {
-	// called the first time extension is loaded and sets all pointers to external C functions we use
-	fmu.Lock()
-	defer fmu.Unlock()
-
-	explainPropertyText = func(qlabel, value *C.char, es *C.ExplainState) {
-		C.callExplainPropertyText(h, qlabel, value, es)
-	}
-	createForeignscanPath = func(root *C.PlannerInfo, rel *C.RelOptInfo, target *C.PathTarget,
-		rows C.double, startup_cost, total_cost Cost, pathkeys *C.List,
-		required_outer C.Relids, fdw_outerpath *C.Path, fdw_private *C.List) *C.ForeignPath {
-		return C.call_create_foreignscan_path(h,
-			root, rel, target, C.double(rows),
-			C.Cost(startup_cost), C.Cost(total_cost),
-			pathkeys, required_outer, fdw_outerpath, fdw_private,
-		)
-	}
-	addPath = func(parent_rel *C.RelOptInfo, new_path *C.Path) {
-		C.call_add_path(h, parent_rel, new_path)
-	}
-	execClearTuple = func(slot *C.TupleTableSlot) *C.TupleTableSlot {
-		return C.callExecClearTuple(h, slot)
-	}
-	buildTupleFromCStrings = func(attinmeta *C.AttInMetadata, values **C.char) C.HeapTuple {
-		return C.callBuildTupleFromCStrings(h, attinmeta, values)
-	}
-	tupleDescGetAttInMetadata = func(tupdesc C.TupleDesc) *C.AttInMetadata {
-		return C.callTupleDescGetAttInMetadata(h, tupdesc)
-	}
-	execStoreTuple = func(tuple C.HeapTuple, slot *C.TupleTableSlot, buffer C.Buffer, shouldFree C.bool) *C.TupleTableSlot {
-		return C.callExecStoreTuple(h, tuple, slot, buffer, shouldFree)
-	}
-	getForeignTable = func(relid C.Oid) *C.ForeignTable {
-		return C.callGetForeignTable(h, relid)
-	}
-	defGetString = func(def *C.DefElem) *C.char {
-		return C.callDefGetString(h, def)
-	}
-}
 
 //export goAnalyzeForeignTable
 func goAnalyzeForeignTable(relation C.Relation, fnc *C.AcquireSampleRowsFunc, totalpages *C.BlockNumber) C.bool {
@@ -311,14 +182,14 @@ func goGetForeignPaths(root *C.PlannerInfo, baserel *C.RelOptInfo, foreigntablei
 	// Create possible access paths for a scan on the foreign table
 	opts := getFTableOptions(Oid(foreigntableid))
 	st := table.Stats(opts)
-	addPath(baserel,
-		(*C.Path)(unsafe.Pointer(createForeignscanPath(
+	C.add_path(baserel,
+		(*C.Path)(unsafe.Pointer(C.create_foreignscan_path(
 			root,
 			baserel,
 			baserel.reltarget,
 			baserel.rows,
-			st.StartCost,
-			st.TotalCost,
+			C.Cost(st.StartCost),
+			C.Cost(st.TotalCost),
 			nil, // no pathkeys
 			nil, // no outer rel either
 			nil, // no extra plan
@@ -354,7 +225,7 @@ func goIterateForeignScan(node *C.ForeignScanState) *C.TupleTableSlot {
 	s := getState(node.fdw_state)
 
 	slot := node.ss.ss_ScanTupleSlot
-	execClearTuple(slot)
+	C.ExecClearTuple(slot)
 
 	row := s.Iter.Next()
 	if row == nil {
@@ -373,9 +244,9 @@ func goIterateForeignScan(node *C.ForeignScanState) *C.TupleTableSlot {
 	}
 
 	rel := node.ss.ss_currentRelation
-	attinmeta := tupleDescGetAttInMetadata(rel.rd_att)
-	tuple := buildTupleFromCStrings(attinmeta, (**C.char)(&values[0]))
-	execStoreTuple(tuple, slot, C.InvalidBuffer, 1)
+	attinmeta := C.TupleDescGetAttInMetadata(rel.rd_att)
+	tuple := C.BuildTupleFromCStrings(attinmeta, (**C.char)(&values[0]))
+	C.ExecStoreTuple(tuple, slot, C.InvalidBuffer, 1)
 	return slot
 }
 
@@ -439,7 +310,7 @@ func getState(p unsafe.Pointer) *State {
 }
 
 func getFTableOptions(id Oid) Options {
-	f := getForeignTable(C.Oid(id))
+	f := C.GetForeignTable(C.Oid(id))
 	return getOptions(f.options)
 }
 
@@ -448,7 +319,7 @@ func getOptions(opts *C.List) Options {
 	for it := opts.head; it != nil; it = it.next {
 		el := C.cellGetDef(it)
 		name := C.GoString(el.defname)
-		val := C.GoString(defGetString(el))
+		val := C.GoString(C.defGetString(el))
 		m[name] = val
 	}
 	return m
